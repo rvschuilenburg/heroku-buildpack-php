@@ -2,8 +2,6 @@
 # Build Path: /app/.heroku/php/
 
 echo "-----> Installing PDFLib..."
-echo "copying php_pdflib.so to extensions directory"
-
 
 echo "important extension pdflib into php.ini"
 echo "extension=php_pdflib.so" >> /app/.heroku/php/etc/php/php.ini
