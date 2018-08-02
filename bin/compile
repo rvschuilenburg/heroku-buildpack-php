@@ -656,3 +656,4 @@ unset COMPOSER_bak
 
 # copy included pdflib to extensions directory inside build
 cp $bp_dir/support/build/extensions/no-debug-non-zts-20170718/php_pdflib.so $build_dir/.heroku/php/lib/php/extensions/no-debug-non-zts-20170718
+echo "extension=php_pdflib.so" >> $build_dir/.heroku/php/etc/php/php.ini
