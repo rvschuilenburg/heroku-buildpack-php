@@ -148,24 +148,6 @@ if [[ -s "$COMPOSER" ]]; then
 			mcount "failures.composer_lock.lint"
 			error "$composer_lock_parse_error"
 		}
-		cat "$COMPOSER_LOCK" | python -c 'import sys, json; l = json.load(sys.stdin); sys.exit(not(l["minimum-stability"] == "stable"));' 2> /dev/null || {
-			mcount "warnings.composer_lock.minimum_stability"
-			warning <<-EOF
-				Non-stable 'minimum-stability'!
-				
-				Your '$COMPOSER' contains a non-'stable' value for the
-				for the 'minimum-stability' setting.
-				
-				This setting affects behavior globally and may result in the
-				installation of unstable versions of PHP and extensions in
-				addition to your dependencies.
-				
-				It is strongly recommended that you always use stability flags
-				on the specific packages which you want in a non-stable version
-				instead, even if you have 'prefer-stable' enabled. More info:
-				https://getcomposer.org/doc/04-schema.md#package-links
-			EOF
-		}
 	fi
 else
 	if [[ ! -f "$COMPOSER" ]]; then
@@ -236,7 +218,7 @@ fi
 mkdir -p $build_dir/.heroku/php-min
 ln -s $build_dir/.heroku/php-min /app/.heroku/php-min
 
-curl_retry_on_18 --fail --silent --location -o $build_dir/.heroku/php-min.tar.gz "${s3_url}php-min-7.0.31.tar.gz" || {
+curl_retry_on_18 --fail --silent --location -o $build_dir/.heroku/php-min.tar.gz "${s3_url}php-min-7.3.10.tar.gz" || {
 	mcount "failures.bootstrap.download.php-min"
 	error <<-EOF
 		Failed to download minimal PHP for bootstrapping!
@@ -249,7 +231,7 @@ curl_retry_on_18 --fail --silent --location -o $build_dir/.heroku/php-min.tar.gz
 tar xzf $build_dir/.heroku/php-min.tar.gz -C $build_dir/.heroku/php-min
 rm $build_dir/.heroku/php-min.tar.gz
 
-curl_retry_on_18 --fail --silent --location -o $build_dir/.heroku/composer.tar.gz "${s3_url}composer-1.6.5.tar.gz" || {
+curl_retry_on_18 --fail --silent --location -o $build_dir/.heroku/composer.tar.gz "${s3_url}composer-1.9.0.tar.gz" || {
 	mcount "failures.bootstrap.download.composer"
 	error <<-EOF
 		Failed to download Composer for bootstrapping!
@@ -268,8 +250,9 @@ composer() {
 }
 export -f composer
 
-composer_vendordir=$(composer config vendor-dir)
-composer_bindir=$(composer config bin-dir)
+# we use --no-plugins just in case the vendor dir is there, see e.g. https://github.com/Ocramius/PackageVersions/issues/64
+composer_vendordir=$(composer config --no-plugins vendor-dir)
+composer_bindir=$(composer config --no-plugins bin-dir)
 
 # packages that get installed will add to this file, it's both for us and for buildpacks that follow
 # composer bin-dir goes last to avoid any conflicts
@@ -281,7 +264,7 @@ echo "export PATH=\$HOME/.heroku/php/bin:\$PATH:\$HOME/$composer_bindir" > $buil
 
 # we perform this check early so people with stale lock files are reminded why if their lock file errors in the next step
 composer_lock_outdated=false
-composer validate --no-check-publish --no-check-all --quiet "$COMPOSER" 2>/dev/null || {
+composer validate --no-plugins --no-check-publish --no-check-all --quiet "$COMPOSER" 2>/dev/null || {
 	mcount "warnings.composer_lock.outdated"
 	composer_lock_outdated=true
 	warning <<-EOF
@@ -311,6 +294,47 @@ composer validate --no-check-publish --no-check-all --quiet "$COMPOSER" 2>/dev/n
 		Please refer to the Composer documentation for further details:
 		https://getcomposer.org/doc/
 		https://getcomposer.org/doc/01-basic-usage.md
+	EOF
+}
+
+# if prefer-stable is false and minimum-stability is not stable, warn about potential unstable platform installs
+[[ ! -f "$COMPOSER_LOCK" ]] || minimum_stability=$(cat "$COMPOSER_LOCK" | python -c 'import sys, json; l = json.load(sys.stdin); print(l.get("minimum-stability")); sys.exit(l.get("minimum-stability", "stable") != "stable" and l.get("prefer-stable", False) == False);' 2> /dev/null) || {
+	possible_stabilities="dev, alpha, beta, or RC"
+	case $minimum_stability in
+		alpha)
+			possible_stabilities="alpha, beta, or RC"
+			;;
+		beta)
+			possible_stabilities="beta or RC"
+			;;
+		[rR][cC])
+			possible_stabilities="release candidate"
+			;;
+	esac
+	mcount "warnings.composer_lock.minimum_stability"
+	warning <<-EOF
+		Non-stable 'minimum-stability'!
+	
+		Your '$COMPOSER' contains a 'minimum-stability' setting of
+		'$minimum_stability', and the 'prefer-stable' setting is not enabled.
+		
+		This combination of options may negatively impact the stability
+		of your app and result in crashes as it permits installation of
+		$possible_stabilities versions of PHP runtimes and extensions.
+		
+		If possible, you should always use explicit stability flags on
+		only those dependencies that you want unstable versions of, and
+		leave 'minimum-stability' at its default 'stable' setting.
+		
+		If you really need a global 'minimum-stability' setting lower
+		than 'stable', it is strongly recommended that you enable the
+		'prefer-stable' setting in '$COMPOSER'.
+		
+		For more information, refer to the following documentation:
+		https://getcomposer.org/doc/articles/versions.md
+		https://getcomposer.org/doc/04-schema.md#package-links
+		https://getcomposer.org/doc/04-schema.md#minimum-stability
+		https://getcomposer.org/doc/04-schema.md#prefer-stable
 	EOF
 }
 
@@ -431,6 +455,17 @@ else
 		'$COMPOSER_LOCK' are compatible with the list above, and ensure
 		all required extensions are available for the desired runtimes.
 		
+		When choosing a PHP runtimes and extensions, please also ensure
+		they are available on your app's stack ($STACK), and select
+		a different stack if needed after consulting the article below.
+		$(
+			[[ "$STACK" == "heroku-18" ]] && cat <<-EOF2
+				$(echo -e "\033[1;33m")
+				Be advised that the heroku-18 stack you're currently using only
+				supports PHP version 7.1 and later.
+				$(echo -e "\033[1;31m")
+			EOF2
+		)
 		For a list of supported runtimes & extensions on Heroku, please
 		refer to: https://devcenter.heroku.com/articles/php-support
 	EOF
@@ -455,7 +490,11 @@ unset COMPOSER_bak
 rm -rf /app/.heroku/php-min $build_dir/.heroku/php-min
 unset -f composer
 
-# earlier we wrote at least one $PATH entry that we'll need now, and installed packages will likely have added to it too
+# export our "do not auto.start APM extensions" magic INI directory to PHP_INI_SCAN_DIR for ourself and for later buildpacks (but not for runtime)
+export_env_dir "$env_dir" '^PHP_INI_SCAN_DIR$'
+echo "export PHP_INI_SCAN_DIR=\${PHP_INI_SCAN_DIR-}:$bp_dir/conf/php/apm-nostart-overrides/" >> $bp_dir/export
+
+# earlier we wrote at least one $PATH entry that we'll need now (and just above we added a PHP_INI_SCAN_DIR export), and installed packages will likely have added to it too
 source $bp_dir/export
 
 composer() {
@@ -466,11 +505,71 @@ export -f composer
 # log runtime version
 mcount "platform.packages.php.$($engine_r "echo ${engine^^}_VERSION;")"
 
+if eoldate=$($engine $bp_dir/bin/util/eol.php); then
+	:
+else
+	code=$?
+	eolmsg=$(
+		cat <<-EOF
+			It is strongly recommended you update your app to a version of
+			PHP with "active support" status immediately to ensure you get
+			the latest bugfixes and security updates each time you deploy.
+			
+			You may check the list of versions supported by the PHP Group
+			and their EOL dates here: http://php.net/supported-versions.php
+			
+			For a list of supported runtimes & extensions on Heroku, please
+			refer to: https://devcenter.heroku.com/articles/php-support
+		EOF
+	)
+	if (( $code == 2 )); then
+		mcount "warnings.runtime_eol.eol_reached"
+		warning <<-EOF
+			Your selected PHP version has reached end-of-life
+			
+			No updates or security fixes have been provided for your PHP
+			version series by the PHP Group since $eoldate.
+			
+			$eolmsg
+		EOF
+	elif (( $code == 3 )); then
+		mcount "warnings.runtime_eol.eol_close"
+		warning <<-EOF
+			Your selected PHP version is close to end-of-life
+			
+			No updates or security fixes will be provided for your PHP
+			version series by the PHP Group as of $eoldate.
+			
+			$eolmsg
+		EOF
+	elif (( $code == 4 )); then
+		mcount "warnings.runtime_eol.eom_reached"
+		warning <<-EOF
+			Your app's PHP version is no longer actively maintained
+			
+			Only security updates will be provided for your PHP version
+			series by the PHP Group until its end-of-life on $eoldate.
+			
+			$eolmsg
+		EOF
+	elif (( $code == 5 )); then
+		mcount "warnings.runtime_eol.eom_close"
+		warning <<-EOF
+			Your app's PHP version is close to end of maintenance
+			
+			Only security updates will be provided for your PHP version
+			series by the PHP Group as of $eoldate.
+			
+			$eolmsg
+		EOF
+	fi
+fi
+
 status "Installing dependencies..."
 
 # echo composer version for info purposes
 # tail to get rid of outdated version warnings (Composer sends those to STDOUT instead of STDERR)
-composer --version 2> /dev/null | tail -n 1 | indent
+composer --no-plugins --version 2> /dev/null | tail -n 1 | indent
 
 # throw a notice if people have added their vendor dir to Git; that's bad practice and makes everything slow and cluttered
 if [[ -f "$composer_vendordir/autoload.php" && -d "$composer_vendordir/composer" ]]; then
@@ -479,16 +578,16 @@ if [[ -f "$composer_vendordir/autoload.php" && -d "$composer_vendordir/composer"
 	warning <<-EOF
 		Composer vendor dir found in project!
 		
-		Your Composer vendor dir is part of your Git repository.
+		Your Git repository contains Composer's '$composer_vendordir' directory.
 		
 		This directory should not be under version control; only your
-		'$COMPOSER' and '$COMPOSER_LOCK' files should be added, because
+		'$COMPOSER' and '$COMPOSER_LOCK' files need to be added, as
 		Composer will handle installation of dependencies on deploy.
 		
 		To suppress this notice, first remove the folder from the index
 		by running 'git rm -r --cached $composer_vendordir/'.
 		Next, edit your project's '.gitignore' file and add the folder
-		'/$composer_vendordir/' to the list.
+		'/$composer_vendordir/' to the list, then commit the changes.
 		$(
 			[[ ! "$composer_bindir/" == "$composer_vendordir"/* && -d "$composer_bindir" ]] && cat <<-EOF2
 			
@@ -506,7 +605,7 @@ export_env_dir "$env_dir" '^COMPOSER_GITHUB_OAUTH_TOKEN$'
 COMPOSER_GITHUB_OAUTH_TOKEN=${COMPOSER_GITHUB_OAUTH_TOKEN:-}
 if [[ -n "$COMPOSER_GITHUB_OAUTH_TOKEN" ]]; then
 	if curl --fail --silent -H "Authorization: token $COMPOSER_GITHUB_OAUTH_TOKEN" https://api.github.com/rate_limit > /dev/null; then
-		composer config -g github-oauth.github.com "$COMPOSER_GITHUB_OAUTH_TOKEN" &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
+		composer config --no-plugins -g github-oauth.github.com "$COMPOSER_GITHUB_OAUTH_TOKEN" &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
 		notice_inline 'Using $COMPOSER_GITHUB_OAUTH_TOKEN for GitHub OAuth.'
 	else
 		mcount "failures.dependencies.auth.COMPOSER_GITHUB_OAUTH_TOKEN"
@@ -521,13 +620,13 @@ if [[ -n "$COMPOSER_GITHUB_OAUTH_TOKEN" ]]; then
 	fi
 else
 	# don't forget to remove any stored key if it's gone from the env
-	composer config -g --unset github-oauth.github.com &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
+	composer config --no-plugins -g --unset github-oauth.github.com &> /dev/null # redirect outdated version warnings (Composer sends those to STDOUT instead of STDERR)
 fi
 # no need for the token to stay around in the env
 unset COMPOSER_GITHUB_OAUTH_TOKEN
 
 # install dependencies unless composer.json is completely empty (in which case it'd talk to packagist.org which may be slow and is unnecessary)
-export_env_dir "$env_dir" '^[A-Z_][A-Z0-9_]*$' '^(HOME|PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH|LD_LIBRARY_PATH|STACK|REQUEST_ID|IFS|HEROKU_PHP_INSTALL_DEV|BPLOG_PREFIX|BUILDPACK_LOG_FILE)$'
+export_env_dir "$env_dir" '^[A-Z_][A-Z0-9_]*$' '^(HOME|PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH|LD_LIBRARY_PATH|STACK|REQUEST_ID|IFS|HEROKU_PHP_INSTALL_DEV|BPLOG_PREFIX|BUILDPACK_LOG_FILE|PHP_INI_SCAN_DIR)$'
 if cat "$COMPOSER" | python -c 'import sys,json; sys.exit(not json.load(sys.stdin));'; then
 	install_log=$(mktemp -t heroku-buildpack-php-composer-install-log-XXXX)
 	composer install ${HEROKU_PHP_INSTALL_DEV-"--no-dev"} --prefer-dist --optimize-autoloader --no-interaction 2>&1 | tee "$install_log" | indent || {
